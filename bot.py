@@ -1,21 +1,29 @@
+from dotenv import load_dotenv
 import logging
 import os
 import requests
 import sys
-import pytesseract
+import easyocr
+import numpy as np
 from PIL import Image
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 from io import BytesIO
+import re
+
+# Carregar as variáveis de ambiente do arquivo .env
+load_dotenv()
 
 # Substitua pelo seu token real
-TOKEN = '7919911199:AAGIOaUhDMFkTBOi7llniqJv5nJ9NCCvBiE'
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+URL_TELEGRAM_GETME = os.getenv('URL_TELEGRAM_GETME')
+CAMINHO_TESSERACT = os.getenv('CAMINHO_TESSERACT')
 
-if not TOKEN:
+if not BOT_TOKEN:
     raise ValueError("A variável de ambiente BOT_TOKEN não está definida!")
 
 # URL para validar o token
-URL = f"https://api.telegram.org/bot{TOKEN}/getMe"
+URL = f"{URL_TELEGRAM_GETME}{BOT_TOKEN}/getMe"
 
 # Função para validar o token
 def validar_token():
@@ -35,11 +43,9 @@ def validar_token():
 # Função para verificar se o caminho do Tesseract está correto
 def verificar_tesseract():
     try:
-        # Defina o caminho correto do Tesseract
-        pytesseract.pytesseract.tesseract_cmd = '/caminho/para/tesseract/tesseract'  # Atualize para o caminho correto
-
         # Teste se o Tesseract está funcionando corretamente
-        test_text = pytesseract.image_to_string('test_image.png')  # Usando uma imagem de teste
+        pytesseract.pytesseract.tesseract_cmd = CAMINHO_TESSERACT # Atualize para o caminho correto
+        test_text = pytesseract.image_to_string('photo_teste.jpg')  # Usando uma imagem de teste
         print("✅ Tesseract está funcionando corretamente.")
     except pytesseract.pytesseract.TesseractNotFoundError:
         print("❌ Erro: Tesseract não encontrado. Verifique a instalação e o caminho.")
@@ -48,14 +54,57 @@ def verificar_tesseract():
         print(f"❌ Erro ao executar o Tesseract: {e}")
         sys.exit(1)
 
-# Função para ler o texto do comprovante (imagem)
-def ler_comprovante(image_data):
-    """Usa o Tesseract para ler texto de uma imagem."""
+# Função para ler o texto do comprovante (imagem) usando o EasyOCR
+def ler_comprovante_easyocr(image_data):
+    """Usa o EasyOCR para ler texto de uma imagem e retorna um resumo filtrado."""
+    # Converter os dados de imagem em um formato que o EasyOCR entenda
     image = Image.open(BytesIO(image_data))
-    texto = pytesseract.image_to_string(image)
-    return texto.strip()
+    image_np = np.array(image)  # Converte para numpy array
+    
+    # Inicializa o leitor EasyOCR
+    reader = easyocr.Reader(['pt', 'en'])  # Suporta vários idiomas
+    result = reader.readtext(image_np)
 
-# Função que trata o comando /start
+    # Extrai o texto detectado
+    texto = " ".join([res[1] for res in result])
+
+    # Filtra os dados relevantes com base em palavras-chave e regex
+    dados_resumo = filtrar_dados(texto)
+    
+    return dados_resumo
+
+def filtrar_dados(texto):
+    """Filtra os dados de favorecido, pagador e vencimento do texto extraído."""
+    dados = {
+        "favorecido": None,
+        "pagador": None,
+        "vencimento": None
+    }
+    
+    # Regex para identificar o favorecido, pagador e vencimento
+    favorecido_regex = r"Favorecido\s*[:\-]?\s*([a-zA-Z\s]+)"
+    pagador_regex = r"Pagador\s*[:\-]?\s*([a-zA-Z\s]+)"
+    vencimento_regex = r"Vencimento\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})"
+    
+    # Buscando os dados com regex
+    favorecido = re.search(favorecido_regex, texto, re.IGNORECASE)
+    if favorecido:
+        dados["favorecido"] = favorecido.group(1).strip()
+    
+    pagador = re.search(pagador_regex, texto, re.IGNORECASE)
+    if pagador:
+        dados["pagador"] = pagador.group(1).strip()
+    
+    vencimento = re.search(vencimento_regex, texto, re.IGNORECASE)
+    if vencimento:
+        dados["vencimento"] = vencimento.group(1).strip()
+    
+    # Montando o resumo
+    resumo = "\n".join([f"{key.capitalize()}: {value}" for key, value in dados.items() if value])
+    
+    return resumo
+
+# Função para tratar o comando /start
 async def start(update: Update, context: CallbackContext) -> None:
     """Envia a mensagem de boas-vindas e exibe o menu."""
     keyboard = [["1. Enviar comprovante para imobiliária"], ["2. Sugestões"]]
@@ -84,14 +133,17 @@ async def processar_comprovante(update: Update, context: CallbackContext) -> Non
     if update.message.photo:
         file = await update.message.photo[-1].get_file()
         image_data = await file.download_as_bytearray()
-        
-        texto = ler_comprovante(image_data)
-        
-        # Envia o resumo para o usuário confirmar
-        await update.message.reply_text(
-            f"Eu encontrei os seguintes dados no comprovante:\n\n{texto}"
-            "\n\nEstá correto? Responda 'Sim' ou 'Não'."
-        )
+
+        dados_resumo = ler_comprovante_easyocr(image_data)  # Usando EasyOCR aqui
+
+        if not dados_resumo:
+            await update.message.reply_text("Não consegui ler ou filtrar as informações da imagem. Tente enviar uma imagem mais legível.")
+        else:
+            # Envia o resumo para o usuário
+            await update.message.reply_text(
+                f"Eu encontrei as seguintes informações no comprovante:\n\n{dados_resumo}"
+                "\n\nEstá correto? Responda 'Sim' ou 'Não'."
+            )
     else:
         await update.message.reply_text("Por favor, envie um arquivo ou imagem com o comprovante.")
 
@@ -111,9 +163,9 @@ async def confirmar_comprovante(update: Update, context: CallbackContext) -> Non
 def main():
     """Inicializa e executa o bot."""
     validar_token()  # Valida o token antes de continuar
-    verificar_tesseract()  # Verifica se o Tesseract está configurado corretamente
+    #verificar_tesseract()  # Verifica se o Tesseract está configurado corretamente
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     # Handlers (comandos e mensagens)
     app.add_handler(CommandHandler("start", start))
